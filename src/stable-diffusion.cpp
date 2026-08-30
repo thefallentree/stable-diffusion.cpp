@@ -253,6 +253,7 @@ public:
     std::string backend_spec;
     std::string params_backend_spec;
     std::string split_mode_spec;
+    bool h3_text_adapter_enabled = false;
     bool auto_fit_enabled = false;
 
     bool diffusion_conv_direct = false;
@@ -705,6 +706,47 @@ public:
         LOG_DEBUG("loaded alphas_cumprod from model file");
     }
 
+    bool validate_h3_text_adapter(const ModelLoader& model_loader) {
+        struct ExpectedTensor {
+            const char* name;
+            int n_dims;
+            int64_t ne0;
+            int64_t ne1;
+        };
+        const std::vector<ExpectedTensor> expected = {
+            {"text_encoders.llm_adapter.net.0.bias", 1, 4096, 1},
+            {"text_encoders.llm_adapter.net.0.weight", 2, 2560, 4096},
+            {"text_encoders.llm_adapter.net.2.bias", 1, 5120, 1},
+            {"text_encoders.llm_adapter.net.2.weight", 2, 4096, 5120},
+        };
+        const auto& tensors = model_loader.get_tensor_storage_map();
+        size_t adapter_tensor_count = 0;
+        for (const auto& [name, _] : tensors) {
+            if (starts_with(name, "text_encoders.llm_adapter.")) {
+                adapter_tensor_count++;
+            }
+        }
+        if (adapter_tensor_count != expected.size()) {
+            LOG_ERROR("MiniMax-H3 text adapter must contain exactly four tensors; found %zu",
+                      adapter_tensor_count);
+            return false;
+        }
+        for (const auto& item : expected) {
+            auto tensor = tensors.find(item.name);
+            if (tensor == tensors.end()) {
+                LOG_ERROR("MiniMax-H3 text adapter is missing '%s'", item.name);
+                return false;
+            }
+            const TensorStorage& storage = tensor->second;
+            if (storage.type != GGML_TYPE_F32 || storage.n_dims != item.n_dims ||
+                storage.ne[0] != item.ne0 || storage.ne[1] != item.ne1) {
+                LOG_ERROR("invalid MiniMax-H3 text adapter tensor: %s", storage.to_string().c_str());
+                return false;
+            }
+        }
+        return true;
+    }
+
     bool init_model_loader(ModelLoader& model_loader,
                            const sd_ctx_params_t* sd_ctx_params,
                            bool& use_tae,
@@ -785,6 +827,15 @@ public:
             LOG_INFO("loading llm vision from '%s'", sd_ctx_params->llm_vision_path);
             if (!model_loader.init_from_file(sd_ctx_params->llm_vision_path, "text_encoders.llm.visual.")) {
                 LOG_WARN("loading llm vision from '%s' failed", sd_ctx_params->llm_vision_path);
+            }
+        }
+
+        if (strlen(SAFE_STR(sd_ctx_params->llm_adapter_path)) > 0) {
+            LOG_INFO("loading llm adapter from '%s'", sd_ctx_params->llm_adapter_path);
+            if (!model_loader.init_from_file(sd_ctx_params->llm_adapter_path,
+                                             "text_encoders.llm_adapter.")) {
+                LOG_ERROR("loading llm adapter from '%s' failed", sd_ctx_params->llm_adapter_path);
+                return false;
             }
         }
 
@@ -907,6 +958,36 @@ public:
             return false;
         } else {
             LOG_INFO("Version: %s ", model_version_to_str[version]);
+        }
+
+        const bool have_h3_text_adapter = strlen(SAFE_STR(sd_ctx_params->llm_adapter_path)) > 0;
+        if (have_h3_text_adapter) {
+            if (!sd_version_is_minimax_h3(version)) {
+                LOG_ERROR("--llm-adapter is only supported for MiniMax-H3");
+                return false;
+            }
+            if (!validate_h3_text_adapter(model_loader)) {
+                return false;
+            }
+            bool have_2560_embedding = false;
+            for (const auto& [name, storage] : model_loader.get_tensor_storage_map()) {
+                if (starts_with(name, "text_encoders.llm.") &&
+                    ends_with(name, "embed_tokens.weight") && storage.ne[0] == LLM::H3TextAdapter::INPUT_DIM) {
+                    have_2560_embedding = true;
+                    break;
+                }
+            }
+            if (!have_2560_embedding) {
+                LOG_ERROR("MiniMax-H3 text adapter requires a 2560-dimensional student text encoder");
+                return false;
+            }
+            for (const auto& [name, _] : model_loader.get_tensor_storage_map()) {
+                if (starts_with(name, "text_encoders.llm.visual.")) {
+                    LOG_ERROR("MiniMax-H3 distilled text encoder does not support vision inputs");
+                    return false;
+                }
+            }
+            h3_text_adapter_enabled = true;
         }
 
         if (auto_fit_enabled) {
@@ -3599,6 +3680,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              "t5xxl_path: %s\n"
              "llm_path: %s\n"
              "llm_vision_path: %s\n"
+             "llm_adapter_path: %s\n"
              "diffusion_model_path: %s\n"
              "high_noise_diffusion_model_path: %s\n"
              "uncond_diffusion_model_path: %s\n"
@@ -3633,6 +3715,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              SAFE_STR(sd_ctx_params->t5xxl_path),
              SAFE_STR(sd_ctx_params->llm_path),
              SAFE_STR(sd_ctx_params->llm_vision_path),
+             SAFE_STR(sd_ctx_params->llm_adapter_path),
              SAFE_STR(sd_ctx_params->diffusion_model_path),
              SAFE_STR(sd_ctx_params->high_noise_diffusion_model_path),
              SAFE_STR(sd_ctx_params->uncond_diffusion_model_path),
@@ -5898,6 +5981,18 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
                                                                               GenerationRequest* request) {
     ImageGenerationLatents latents;
     int64_t prepare_start_ms = ggml_time_ms();
+
+    if (sd_version_is_minimax_h3(sd_ctx->sd->version) &&
+        sd_ctx->sd->h3_text_adapter_enabled &&
+        (sd_vid_gen_params->init_image.data != nullptr ||
+         sd_vid_gen_params->end_image.data != nullptr ||
+         sd_vid_gen_params->ref_images_count > 0 ||
+         sd_vid_gen_params->ref_videos_count > 0 ||
+         sd_vid_gen_params->ref_audios_count > 0)) {
+        LOG_ERROR("MiniMax-H3 distilled text encoder only supports text-to-video; "
+                  "use the full H3 text encoder for keyframes or references");
+        return std::nullopt;
+    }
 
     sd::Tensor<float> start_image;
     sd::Tensor<float> end_image;

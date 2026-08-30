@@ -238,6 +238,7 @@ typedef struct {
     bool auto_fit;
     const char* rpc_servers;
     const char* model_args;
+    const char* llm_adapter_path;
 } sd_ctx_params_t;
 
 typedef struct {

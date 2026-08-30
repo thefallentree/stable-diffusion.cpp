@@ -1839,7 +1839,11 @@ struct LLMEmbedder : public Conditioner {
         } else if (sd_version_is_z_image(version) || version == VERSION_OVIS_IMAGE || version == VERSION_FLUX2_KLEIN) {
             arch = LLM::LLMArch::QWEN3;
         }
-        if (arch == LLM::LLMArch::MISTRAL_SMALL_3_2 || arch == LLM::LLMArch::MINISTRAL_3_3B) {
+        const bool have_h3_text_adapter =
+            tensor_storage_map.find("text_encoders.llm_adapter.net.0.weight") != tensor_storage_map.end();
+        if (sd_version_is_minimax_h3(version) && have_h3_text_adapter) {
+            tokenizer = std::make_shared<MiniMaxH3Tokenizer>();
+        } else if (arch == LLM::LLMArch::MISTRAL_SMALL_3_2 || arch == LLM::LLMArch::MINISTRAL_3_3B) {
             tokenizer = std::make_shared<MistralTokenizer>();
         } else if (arch == LLM::LLMArch::GPT_OSS_20B) {
             tokenizer = std::make_shared<GPTOSSTokenizer>();
@@ -2150,7 +2154,7 @@ struct LLMEmbedder : public Conditioner {
 
         if (sd_version_is_minimax_h3(version)) {
             prompt_template_encode_start_idx = 0;
-            out_layers                       = {50};
+            out_layers                       = {static_cast<int>(llm->config.num_layers)};
             prompt_attn_range                = {0, 0};
 
             if (llm->enable_vision) {

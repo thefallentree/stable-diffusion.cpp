@@ -45,7 +45,11 @@ void Qwen2Tokenizer::load_from_merges(const std::string& merges_utf8_str) {
     bpe_len = rank;
 }
 
-Qwen2Tokenizer::Qwen2Tokenizer(const std::string& merges_utf8_str) {
+Qwen2Tokenizer::Qwen2Tokenizer(const std::string& merges_utf8_str)
+    : Qwen2Tokenizer(merges_utf8_str, {}) {}
+
+Qwen2Tokenizer::Qwen2Tokenizer(const std::string& merges_utf8_str,
+                               const std::vector<std::string>& special_tokens_override) {
     UNK_TOKEN = "<|endoftext|>";
     EOS_TOKEN = "<|endoftext|>";
     PAD_TOKEN = "<|endoftext|>";
@@ -54,43 +58,90 @@ Qwen2Tokenizer::Qwen2Tokenizer(const std::string& merges_utf8_str) {
     EOS_TOKEN_ID = 151643;
     PAD_TOKEN_ID = 151643;
 
-    special_tokens = {
-        "<|endoftext|>",
-        "<|im_start|>",
-        "<|im_end|>",
-        "<|object_ref_start|>",
-        "<|object_ref_end|>",
-        "<|box_start|>",
-        "<|box_end|>",
-        "<|quad_start|>",
-        "<|quad_end|>",
-        "<|vision_start|>",
-        "<|vision_end|>",
-        "<|vision_pad|>",
-        "<|image_pad|>",
-        "<|video_pad|>",
-        "<tool_call>",
-        "</tool_call>",
-        "<|fim_prefix|>",
-        "<|fim_middle|>",
-        "<|fim_suffix|>",
-        "<|fim_pad|>",
-        "<|repo_name|>",
-        "<|file_sep|>",
-        "<tool_response>",
-        "</tool_response>",
-        "<think>",
-        "</think>",
-        "<|boi_token|>",
-        "<|bor_token|>",
-        "<|eor_token|>",
-        "<|bot_token|>",
-        "<|tms_token|>",
-    };
+    if (special_tokens_override.empty()) {
+        special_tokens = {
+            "<|endoftext|>",
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|object_ref_start|>",
+            "<|object_ref_end|>",
+            "<|box_start|>",
+            "<|box_end|>",
+            "<|quad_start|>",
+            "<|quad_end|>",
+            "<|vision_start|>",
+            "<|vision_end|>",
+            "<|vision_pad|>",
+            "<|image_pad|>",
+            "<|video_pad|>",
+            "<tool_call>",
+            "</tool_call>",
+            "<|fim_prefix|>",
+            "<|fim_middle|>",
+            "<|fim_suffix|>",
+            "<|fim_pad|>",
+            "<|repo_name|>",
+            "<|file_sep|>",
+            "<tool_response>",
+            "</tool_response>",
+            "<think>",
+            "</think>",
+            "<|boi_token|>",
+            "<|bor_token|>",
+            "<|eor_token|>",
+            "<|bot_token|>",
+            "<|tms_token|>",
+        };
+    } else {
+        special_tokens = special_tokens_override;
+    }
 
     if (merges_utf8_str.size() > 0) {
         load_from_merges(merges_utf8_str);
     } else {
         load_from_merges(load_qwen2_merges());
     }
+}
+
+MiniMaxH3Tokenizer::MiniMaxH3Tokenizer()
+    : Qwen2Tokenizer("",
+                     {
+                         // MiniMax-H3 uses the Qwen2 merges and base added tokens,
+                         // then assigns its seven model-specific tokens from 151669.
+                         "<|endoftext|>",
+                         "<|im_start|>",
+                         "<|im_end|>",
+                         "<|object_ref_start|>",
+                         "<|object_ref_end|>",
+                         "<|box_start|>",
+                         "<|box_end|>",
+                         "<|quad_start|>",
+                         "<|quad_end|>",
+                         "<|vision_start|>",
+                         "<|vision_end|>",
+                         "<|vision_pad|>",
+                         "<|image_pad|>",
+                         "<|video_pad|>",
+                         "<tool_call>",
+                         "</tool_call>",
+                         "<|fim_prefix|>",
+                         "<|fim_middle|>",
+                         "<|fim_suffix|>",
+                         "<|fim_pad|>",
+                         "<|repo_name|>",
+                         "<|file_sep|>",
+                         "<tool_response>",
+                         "</tool_response>",
+                         "<think>",
+                         "</think>",
+                         "<d>",
+                         "</d>",
+                         "<|cutoff|>",
+                         "<|lyrics_start|>",
+                         "<|lyrics_end|>",
+                         "<|caption_start|>",
+                         "<|caption_end|>",
+                     }) {
+    EOS_TOKEN    = "<|im_end|>";
+    EOS_TOKEN_ID = 151645;
 }

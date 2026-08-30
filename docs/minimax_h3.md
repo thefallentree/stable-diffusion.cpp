@@ -19,6 +19,18 @@ language layers and exported without the final language-model normalization.
 Its Qwen3-VL vision tower, including the three DeepStack mergers, must also be
 present. If the vision tower is stored separately, pass it with `--llm_vision`.
 
+For text-to-video on lower-memory systems, a distilled Qwen3-VL-4B student can
+be used with its external `2560 -> 4096 -> 5120` adapter:
+
+```sh
+--llm qwen3vl-4b-h3student-Q4_K_M.gguf \
+--llm-adapter te_adapter_v1.safetensors
+```
+
+The student path uses the MiniMax-H3 tokenizer IDs and bypasses the student's
+final RMS normalization before applying the FP32 adapter. It is text-only; use
+the full H3 text encoder for first/last-frame or Ref2VA conditioning.
+
 Both the original time-embedder DiT and the smaller AdaLN curve-table variant
 are detected from their weights.
 
@@ -30,6 +42,8 @@ are detected from their weights.
 - Download qwen3vl_32b_minimax_h3
     - safetensors: https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/text_encoders
     - gguf: https://huggingface.co/leejet/MiniMax-H3-GGUF/tree/main
+- Optional distilled Qwen3-VL-4B text encoder and adapter (text-to-video only)
+    - gguf/adapter: https://huggingface.co/woodfireind/MiniMax-H3-GGUF-MiniStack/tree/main/text_encoders
 - Download vae
     - safetensors: https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/vae
 - Download audio vae

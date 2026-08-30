@@ -21,6 +21,7 @@
 #include "core/ggml_extend.hpp"
 #include "json.hpp"
 #include "model/common/rope.hpp"
+#include "model/te/h3_text_adapter.h"
 #include "model_loader.h"
 #include "model_manager.h"
 #include "tokenizers/bpe_tokenizer.h"
@@ -1647,6 +1648,7 @@ namespace LLM {
         LLMConfig config;
         bool enable_vision;
         LLM model;
+        std::shared_ptr<H3TextAdapter> h3_text_adapter;
 
         std::vector<int> input_pos_vec;
         std::vector<float> attention_mask_vec;
@@ -1882,6 +1884,11 @@ namespace LLM {
             : GGMLRunner(backend, weight_manager),
               config(LLMConfig::detect_from_weights(tensor_storage_map, prefix, arch)),
               enable_vision(enable_vision_) {
+            const bool have_h3_text_adapter =
+                tensor_storage_map.find("text_encoders.llm_adapter.net.0.weight") != tensor_storage_map.end();
+            if (have_h3_text_adapter) {
+                config.final_norm = false;
+            }
             if (enable_vision && !config.have_vision_weight) {
                 LOG_WARN("no vision weights detected, vision disabled");
                 enable_vision = false;
@@ -1894,6 +1901,10 @@ namespace LLM {
             }
             model = LLM(config, enable_vision, config.llama_cpp_style);
             model.init(params_ctx, tensor_storage_map, prefix);
+            if (have_h3_text_adapter) {
+                h3_text_adapter = std::make_shared<H3TextAdapter>();
+                h3_text_adapter->init(params_ctx, tensor_storage_map, "text_encoders.llm_adapter");
+            }
         }
 
         std::string get_desc() override {
@@ -1902,10 +1913,16 @@ namespace LLM {
 
         void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string prefix) {
             model.get_param_tensors(tensors, prefix);
+            if (h3_text_adapter) {
+                h3_text_adapter->get_param_tensors(tensors, "text_encoders.llm_adapter");
+            }
         }
 
         void get_param_tensor_ops(std::map<ggml_tensor*, enum ggml_op>& tensor_ops) {
             model.get_param_tensor_ops(tensor_ops);
+            if (h3_text_adapter) {
+                h3_text_adapter->get_param_tensor_ops(tensor_ops);
+            }
         }
 
         ggml_tensor* forward(GGMLRunnerContext* ctx,
@@ -1926,6 +1943,9 @@ namespace LLM {
                                                deepstack_image_embeds,
                                                out_layers,
                                                return_all_hidden_states);  // [N, n_token, hidden_size]
+            if (h3_text_adapter) {
+                hidden_states = h3_text_adapter->forward(ctx, hidden_states);
+            }
             return hidden_states;
         }
 
