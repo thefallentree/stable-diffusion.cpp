@@ -488,12 +488,21 @@ namespace MiniMaxH3 {
     struct MiniMaxH3Transformer3DModel : public GGMLBlock {
         Config config;
 
-        explicit MiniMaxH3Transformer3DModel(const Config& config)
+        MiniMaxH3Transformer3DModel(const Config& config,
+                                    bool stabilize_distilled_context)
             : config(config) {
             int64_t video_dim          = config.video_latent_channels * config.patch_t * config.patch_h * config.patch_w;
             blocks["video_patch_proj"] = std::make_shared<Linear>(video_dim, config.hidden_size, true, true);
             blocks["audio_patch_proj"] = std::make_shared<Linear>(config.audio_latent_channels, config.hidden_size, true, true);
-            blocks["condition_proj"]   = std::make_shared<Linear>(config.text_dim, config.hidden_size, true);
+            // Distilled text adapters can emit O(1e4) outliers. For that path,
+            // exact rescaling keeps Q8_1 block sums in FP16 range during the
+            // quantized matmul, then restores the scale before adding bias.
+            blocks["condition_proj"] = std::make_shared<Linear>(config.text_dim,
+                                                                config.hidden_size,
+                                                                true,
+                                                                false,
+                                                                stabilize_distilled_context,
+                                                                stabilize_distilled_context ? 1.f / 128.f : 1.f);
             if (!config.uses_adaln_curves()) {
                 blocks["time_embedder"] = std::make_shared<TimeEmbedder>(config.timestep_input_dim,
                                                                          config.time_embed_hidden_size,
@@ -960,7 +969,8 @@ namespace MiniMaxH3 {
                         std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
             : DiffusionModelRunner(backend, prefix, weight_manager),
               config(Config::detect_from_weights(tensors, prefix)),
-              model(config) {
+              model(config,
+                    tensors.find("text_encoders.llm_adapter.net.0.weight") != tensors.end()) {
             model.init(params_ctx, tensors, prefix);
         }
 
