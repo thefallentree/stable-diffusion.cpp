@@ -55,6 +55,9 @@ RUN apt-get update && \
 COPY --from=build /sd.cpp/build/bin /sd.cpp/bin
 RUN printf '#!/bin/sh\nexec /sd.cpp/bin/sd-cli "$@"\n' > /sd-cli && \
     printf '#!/bin/sh\nexec /sd.cpp/bin/sd-server "$@"\n' > /sd-server && \
-    chmod +x /sd-cli /sd-server
+    chmod +x /sd-cli /sd-server && \
+    mkdir -p /app && \
+    ln -s /sd-cli /app/sd-cli && \
+    ln -s /sd-server /app/sd-server
 
 ENTRYPOINT [ "/sd-cli" ]
