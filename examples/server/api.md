@@ -720,6 +720,8 @@ Example:
 }
 ```
 
+`prompt` must be a non-empty string.
+
 ### LoRA Rules
 
 - The server only accepts explicit LoRA entries from the `lora` field.
@@ -968,6 +970,7 @@ Compared with `img_gen`, the `vid_gen` request body:
 - `vid_gen` is a single video sequence job, so `batch_count` is not part of the request schema
 - `ref_images`, `mask_image`, `control_image`, `control_strength`, `ip_adapter_image`, `ip_adapter_strength`, and `embed_image_metadata` are not part of the request schema
 - `vid_gen` adds `end_image`, `control_frames`, `high_noise_sample_params`, `video_frames`, `fps`, `moe_boundary`, and `vace_strength`
+- `prompt` must be a non-empty string
 
 Example:
 
