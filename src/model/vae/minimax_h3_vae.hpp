@@ -558,11 +558,14 @@ namespace MiniMaxH3VAE {
         }
 
         static sd_tiling_params_t h3_tiling(sd_tiling_params_t params) {
+            const bool explicit_spatial_tiling = params.enabled;
             params.enabled         = true;
             params.temporal_tiling = false;
-            params.tile_size_x     = 16;
-            params.tile_size_y     = 16;
-            params.target_overlap  = 0.25f;
+            if (!explicit_spatial_tiling) {
+                params.tile_size_x    = 16;
+                params.tile_size_y    = 16;
+                params.target_overlap = 0.25f;
+            }
             return params;
         }
 
