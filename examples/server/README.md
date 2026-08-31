@@ -61,6 +61,25 @@ their native worker results under `result.variants[]`, including the effective
 seed and worker index. Worker-local IDs may collide and are therefore never
 used as public pool IDs.
 
+### Compose worker pool
+
+`compose.worker-pool.yaml` manages two GPU-pinned workers and the gateway as a
+single stack. The workers are reachable only on the Compose network; the
+gateway is the only service published on the host. Set the required image,
+model-root, component-path, gateway-path, and state-directory variables, then
+run:
+
+```bash
+docker compose -f examples/server/compose.worker-pool.yaml config
+docker compose -f examples/server/compose.worker-pool.yaml up -d
+docker compose -f examples/server/compose.worker-pool.yaml down
+```
+
+The Compose stack deliberately does not serve a browser application. Build
+`examples/server/frontend`, serve its `dist/index.html` from a separate web
+server, and proxy that application's `/sdcpp/` path to the gateway. This keeps
+frontend deployment independent of model loading and worker restarts.
+
 # Frontend
 
 ## Build with Frontend

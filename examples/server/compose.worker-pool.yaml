@@ -1,0 +1,174 @@
+# The browser UI is intentionally outside this stack. Serve frontend/dist from
+# an independent web server and proxy only /sdcpp/ to the published gateway.
+name: ${H3_COMPOSE_PROJECT:-kync-h3}
+
+x-h3-worker: &h3-worker
+  image: ${H3_SERVER_IMAGE:?set H3_SERVER_IMAGE}
+  pull_policy: ${PULL_POLICY:-missing}
+  restart: unless-stopped
+  init: true
+  ipc: host
+  cap_add:
+    - SYS_NICE
+  ulimits:
+    memlock:
+      soft: -1
+      hard: -1
+  environment:
+    SD_MINIMAX_H3_MLP_FP16: ${H3_MLP_FP16:-1}
+  volumes:
+    - type: bind
+      source: ${MODEL_ROOT:?set MODEL_ROOT}
+      target: /models
+      read_only: true
+  working_dir: /app
+  entrypoint:
+    - /app/sd-server
+  command: &h3-command
+    - --listen-ip
+    - 0.0.0.0
+    - --listen-port
+    - "8080"
+    - --diffusion-model
+    - ${H3_DIFFUSION_CONTAINER_PATH:?set H3_DIFFUSION_CONTAINER_PATH}
+    - --llm
+    - ${H3_TEXT_ENCODER_CONTAINER_PATH:?set H3_TEXT_ENCODER_CONTAINER_PATH}
+    - --llm-adapter
+    - ${H3_TEXT_ADAPTER_CONTAINER_PATH:?set H3_TEXT_ADAPTER_CONTAINER_PATH}
+    - --vae
+    - ${H3_VIDEO_VAE_CONTAINER_PATH:?set H3_VIDEO_VAE_CONTAINER_PATH}
+    - --audio-vae
+    - ${H3_AUDIO_VAE_CONTAINER_PATH:?set H3_AUDIO_VAE_CONTAINER_PATH}
+    - --auto-fit
+    - --split-mode
+    - layer
+    - --diffusion-fa
+    - --rng
+    - cpu
+    - --cfg-scale
+    - "1.0"
+    - --width
+    - ${H3_WIDTH:-384}
+    - --height
+    - ${H3_HEIGHT:-256}
+    - --video-frames
+    - ${H3_FRAMES:-124}
+    - --fps
+    - ${H3_FPS:-24}
+    - --steps
+    - ${H3_STEPS:-25}
+    - --cache-mode
+    - ${H3_CACHE_MODE:-spectrum}
+    - --vae-tiling
+    - --vae-tile-size
+    - ${H3_VAE_TILE_SIZE:-24x16}
+    - --vae-tile-overlap
+    - ${H3_VAE_TILE_OVERLAP:-0.25}
+    - --sampling-method
+    - res_multistep
+    - --scheduler
+    - simple
+  expose:
+    - "8080"
+  healthcheck:
+    test:
+      - CMD
+      - /usr/bin/bash
+      - -c
+      - exec 3<>/dev/tcp/127.0.0.1/8080
+    interval: 5s
+    timeout: 3s
+    retries: 60
+    start_period: 30s
+  networks:
+    - h3-private
+
+services:
+  gpu0:
+    <<: *h3-worker
+    container_name: ${H3_PRIMARY_CONTAINER:-qwen38}
+    labels:
+      ai.kync.profile: h3-min
+      ai.kync.role: inference-worker
+      ai.kync.gpu: ${H3_GPU0_ID:-0}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids:
+                - ${H3_GPU0_ID:-0}
+              capabilities:
+                - gpu
+
+  gpu1:
+    <<: *h3-worker
+    container_name: ${H3_SECONDARY_CONTAINER:-qwen38-h3-gpu1}
+    labels:
+      ai.kync.profile: h3-min
+      ai.kync.role: inference-worker
+      ai.kync.gpu: ${H3_GPU1_ID:-1}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids:
+                - ${H3_GPU1_ID:-1}
+              capabilities:
+                - gpu
+
+  gateway:
+    image: ${H3_GATEWAY_IMAGE:-python:3.12-slim}
+    pull_policy: ${PULL_POLICY:-missing}
+    container_name: ${H3_GATEWAY_CONTAINER:-h3-pool-gateway}
+    restart: unless-stopped
+    init: true
+    labels:
+      ai.kync.profile: h3-min
+      ai.kync.role: api-gateway
+    depends_on:
+      gpu0:
+        condition: service_started
+      gpu1:
+        condition: service_started
+    volumes:
+      - type: bind
+        source: ${H3_GATEWAY_SCRIPT:?set H3_GATEWAY_SCRIPT}
+        target: /app/pool_gateway.py
+        read_only: true
+      - type: bind
+        source: ${H3_POOL_STATE_DIR:?set H3_POOL_STATE_DIR}
+        target: /state
+    command:
+      - python3
+      - /app/pool_gateway.py
+      - --listen-ip
+      - 0.0.0.0
+      - --listen-port
+      - "8080"
+      - --state-dir
+      - /state
+      - --worker
+      - http://gpu0:8080
+      - --worker
+      - http://gpu1:8080
+    ports:
+      - ${BIND_ADDRESS:-127.0.0.1}:${PORT:-8080}:8080
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).read()
+      interval: 5s
+      timeout: 4s
+      retries: 60
+      start_period: 5s
+    networks:
+      - h3-private
+
+networks:
+  h3-private: {}
