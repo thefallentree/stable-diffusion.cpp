@@ -28,6 +28,39 @@ If you want to use a different host or port, pass:
 --listen-ip <ip> --listen-port <port>
 ```
 
+## Multiple async workers
+
+`pool_gateway.py` can preserve the native `/sdcpp/v1` API while dispatching
+independent copies to several `sd-server` processes. This is useful when a
+model fits on one accelerator and aggregate throughput matters more than
+splitting a single generation across devices.
+
+Start one server per device on private ports, then run:
+
+```bash
+python3 examples/server/pool_gateway.py \
+  --listen-ip 127.0.0.1 \
+  --listen-port 8080 \
+  --worker http://127.0.0.1:18083 \
+  --worker http://127.0.0.1:18084 \
+  --state-dir ./pool-state
+```
+
+Normal requests remain one-copy requests. To fan out a native image or video
+request, add:
+
+```json
+{
+  "copies": 2,
+  "seed_stride": 1
+}
+```
+
+The gateway returns a namespaced pool job ID. Completed multi-copy jobs expose
+their native worker results under `result.variants[]`, including the effective
+seed and worker index. Worker-local IDs may collide and are therefore never
+used as public pool IDs.
+
 # Frontend
 
 ## Build with Frontend
