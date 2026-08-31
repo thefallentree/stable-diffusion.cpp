@@ -20,6 +20,10 @@ namespace MiniMaxH3 {
     constexpr int H3_GRAPH_SIZE          = 131072;
     constexpr float FRAME_RESCALE        = 5.f / 3.f;
     constexpr float VISUAL_COND_TIMESTEP = 0.999f;
+    // Main-block attention projections can exceed FP16 range at native video
+    // sequence lengths. Linear restores this power-of-two input scale before
+    // the FP32 residual add, preserving the projection's output magnitude.
+    constexpr float ATTENTION_OUT_PROJ_SCALE = 1.f / 64.f;
 
     static bool fp16_mlp_enabled() {
         static const bool enabled = []() {
@@ -192,13 +196,19 @@ namespace MiniMaxH3 {
         Attention(int64_t hidden_size,
                   int64_t heads,
                   int64_t head_dim,
-                  float eps)
+                  float eps,
+                  float out_scale = 1.f)
             : heads(heads), head_dim(head_dim) {
             int64_t inner      = heads * head_dim;
             blocks["qkv_proj"] = std::make_shared<Linear>(hidden_size, inner * 3, false);
             blocks["q_norm"]   = std::make_shared<RMSNorm>(head_dim, eps);
             blocks["k_norm"]   = std::make_shared<RMSNorm>(head_dim, eps);
-            blocks["out_proj"] = std::make_shared<Linear>(inner, hidden_size, false);
+            blocks["out_proj"] = std::make_shared<Linear>(inner,
+                                                           hidden_size,
+                                                           false,
+                                                           false,
+                                                           false,
+                                                           out_scale);
         }
 
         ggml_tensor* forward(GGMLRunnerContext* ctx,
@@ -411,7 +421,8 @@ namespace MiniMaxH3 {
             blocks["attn"]       = std::make_shared<Attention>(config.hidden_size,
                                                          config.num_attention_heads,
                                                          config.attention_head_dim,
-                                                         config.qk_norm_eps);
+                                                         config.qk_norm_eps,
+                                                         ATTENTION_OUT_PROJ_SCALE);
             blocks["mlp"]        = std::make_shared<MLP>(config.hidden_size,
                                                   config.ffn_hidden_size);
             blocks["adaln_proj"] = std::make_shared<AdaLayerNormModulation>(config.time_embed_dim,
