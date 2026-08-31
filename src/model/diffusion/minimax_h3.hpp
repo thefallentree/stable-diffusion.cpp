@@ -2,10 +2,13 @@
 #define __SD_MODEL_DIFFUSION_MINIMAX_H3_HPP__
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -18,8 +21,19 @@
 namespace MiniMaxH3 {
 
     constexpr int H3_GRAPH_SIZE          = 131072;
+    constexpr int FASTH3_SCHEDULE_ROWS   = 8;
     constexpr float FRAME_RESCALE        = 5.f / 3.f;
     constexpr float VISUAL_COND_TIMESTEP = 0.999f;
+    constexpr std::array<float, FASTH3_SCHEDULE_ROWS> FASTH3_TRAINED_TIMESTEPS = {
+        0.0000834098f,
+        0.0003335557f,
+        0.0271674432f,
+        0.0769230798f,
+        0.1004803851f,
+        0.2000000030f,
+        0.2500000000f,
+        0.5000000000f,
+    };
     // Main-block attention projections can exceed FP16 range at native video
     // sequence lengths. Linear restores this power-of-two input scale before
     // the FP32 residual add, preserving the projection's output magnitude.
@@ -48,6 +62,8 @@ namespace MiniMaxH3 {
         int64_t time_embed_dim           = 2688;
         int64_t rope_inv_freq_len        = 16;
         int64_t adaln_curve_grid         = 0;
+        bool direct_adaln_schedule       = false;
+        bool value_first_swiglu          = false;
         int patch_t                      = 1;
         int patch_h                      = 2;
         int patch_w                      = 2;
@@ -57,6 +73,14 @@ namespace MiniMaxH3 {
 
         bool uses_adaln_curves() const {
             return adaln_curve_grid > 0;
+        }
+
+        bool uses_direct_adaln_schedule() const {
+            return direct_adaln_schedule;
+        }
+
+        bool uses_time_embedder() const {
+            return !uses_adaln_curves() && !uses_direct_adaln_schedule();
         }
 
         static int64_t count_blocks(const String2TensorStorage& tensors,
@@ -107,6 +131,12 @@ namespace MiniMaxH3 {
             if (const auto* table = find("adaln_t_table")) {
                 config.time_embed_dim   = table->ne[0];
                 config.adaln_curve_grid = table->ne[1];
+            } else if (find("blocks.0.adaln_schedule.weight") != nullptr) {
+                config.direct_adaln_schedule = true;
+                // FastH3 direct checkpoints retain the diffusers H3 FFN
+                // layout: [value, gate]. Existing native H3 GGUFs use the
+                // converter's legacy [gate, value] packing instead.
+                config.value_first_swiglu = true;
             } else {
                 if (const auto* weight = find("time_embedder.proj_in.weight")) {
                     config.timestep_input_dim     = weight->ne[0];
@@ -121,13 +151,15 @@ namespace MiniMaxH3 {
             }
 
             LOG_DEBUG("minimax_h3: layers=%" PRId64 ", hidden=%" PRId64 ", heads=%" PRId64
-                      ", head_dim=%" PRId64 ", ffn=%" PRId64 ", adaln_curve=%" PRId64,
+                      ", head_dim=%" PRId64 ", ffn=%" PRId64 ", adaln_curve=%" PRId64
+                      ", direct_adaln=%s",
                       config.num_layers,
                       config.hidden_size,
                       config.num_attention_heads,
                       config.attention_head_dim,
                       config.ffn_hidden_size,
-                      config.adaln_curve_grid);
+                      config.adaln_curve_grid,
+                      config.direct_adaln_schedule ? "yes" : "no");
             return config;
         }
     };
@@ -151,8 +183,12 @@ namespace MiniMaxH3 {
     };
 
     struct MLP : public UnaryBlock {
+        bool value_first;
+
         MLP(int64_t hidden_size,
-            int64_t ffn_hidden_size) {
+            int64_t ffn_hidden_size,
+            bool value_first = false)
+            : value_first(value_first) {
             const bool force_prec_f32 = !fp16_mlp_enabled();
             blocks["fc1"] = std::make_shared<Linear>(hidden_size, ffn_hidden_size * 2, false, false, force_prec_f32, 1.f / 128.f);
             blocks["fc2"] = std::make_shared<Linear>(ffn_hidden_size, hidden_size, false, false, force_prec_f32, 1.f / 128.f);
@@ -162,9 +198,12 @@ namespace MiniMaxH3 {
             auto fc1 = std::dynamic_pointer_cast<Linear>(blocks["fc1"]);
             auto fc2 = std::dynamic_pointer_cast<Linear>(blocks["fc2"]);
             auto uv  = ggml_ext_chunk(ctx->ggml_ctx, fc1->forward(ctx, x), 2, 0);
-            return fc2->forward(ctx, ggml_mul(ctx->ggml_ctx,
-                                              ggml_silu(ctx->ggml_ctx, uv[0]),
-                                              uv[1]));
+            auto value = value_first ? uv[0] : uv[1];
+            auto gate  = value_first ? uv[1] : uv[0];
+            return fc2->forward(ctx,
+                                ggml_mul(ctx->ggml_ctx,
+                                         value,
+                                         ggml_silu(ctx->ggml_ctx, gate)));
         }
     };
 
@@ -256,7 +295,9 @@ namespace MiniMaxH3 {
                                                          config.num_attention_heads,
                                                          config.attention_head_dim,
                                                          config.qk_norm_eps);
-            blocks["mlp"]   = std::make_shared<MLP>(config.hidden_size, config.ffn_hidden_size);
+            blocks["mlp"]   = std::make_shared<MLP>(config.hidden_size,
+                                                     config.ffn_hidden_size,
+                                                     config.value_first_swiglu);
         }
 
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
@@ -413,6 +454,7 @@ namespace MiniMaxH3 {
 
     struct TransformerBlock : public GGMLBlock {
         Config config;
+        std::string prefix;
 
         explicit TransformerBlock(const Config& config)
             : config(config) {
@@ -424,18 +466,65 @@ namespace MiniMaxH3 {
                                                          config.qk_norm_eps,
                                                          ATTENTION_OUT_PROJ_SCALE);
             blocks["mlp"]        = std::make_shared<MLP>(config.hidden_size,
-                                                  config.ffn_hidden_size);
-            blocks["adaln_proj"] = std::make_shared<AdaLayerNormModulation>(config.time_embed_dim,
-                                                                            config.hidden_size,
-                                                                            6,
-                                                                            3,
-                                                                            !config.uses_adaln_curves(),
-                                                                            config.uses_adaln_curves());
+                                                  config.ffn_hidden_size,
+                                                  config.value_first_swiglu);
+            if (!config.uses_direct_adaln_schedule()) {
+                blocks["adaln_proj"] = std::make_shared<AdaLayerNormModulation>(config.time_embed_dim,
+                                                                                config.hidden_size,
+                                                                                6,
+                                                                                3,
+                                                                                !config.uses_adaln_curves(),
+                                                                                config.uses_adaln_curves());
+            }
+        }
+
+        void init_params(ggml_context* ctx,
+                         const String2TensorStorage& tensors = {},
+                         const std::string prefix            = "") override {
+            this->prefix = prefix;
+            GGMLBlock::init_params(ctx, tensors, prefix);
+            if (config.uses_direct_adaln_schedule()) {
+                params["adaln_schedule.weight"] = ggml_new_tensor_2d(ctx,
+                                                                     GGML_TYPE_F32,
+                                                                     config.hidden_size * 6 * 3,
+                                                                     FASTH3_SCHEDULE_ROWS);
+            }
+        }
+
+        ggml_tensor* direct_schedule_modulation(GGMLRunnerContext* ctx,
+                                                ggml_tensor* schedule_indices) const {
+            ggml_tensor* table = nullptr;
+            if (config.uses_direct_adaln_schedule()) {
+                table = params.at("adaln_schedule.weight");
+            } else if (ctx->weight_adapter) {
+                auto empty = ggml_ext_zeros(ctx->ggml_ctx,
+                                            config.hidden_size * 6 * 3,
+                                            FASTH3_SCHEDULE_ROWS,
+                                            1,
+                                            1);
+                auto patched = ctx->weight_adapter->patch_weight(ctx->ggml_ctx,
+                                                                 ctx->backend,
+                                                                 empty,
+                                                                 prefix + "adaln_schedule.weight");
+                if (patched != empty) {
+                    table = patched;
+                }
+            }
+            if (table == nullptr) {
+                return nullptr;
+            }
+            if (schedule_indices == nullptr) {
+                throw std::runtime_error(
+                    "FastH3 direct AdaLN tables require the trained "
+                    "999/749/500/250 sigma grid");
+            }
+            return ggml_get_rows(ctx->ggml_ctx, table, schedule_indices);
         }
 
         ggml_tensor* forward(GGMLRunnerContext* ctx,
                              ggml_tensor* x,
                              ggml_tensor* t_emb,
+                             ggml_tensor* schedule_indices,
                              const std::vector<TokenModulationSpan>& segments,
                              ggml_tensor* pe) {
             auto norm1 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm1"]);
@@ -443,7 +532,10 @@ namespace MiniMaxH3 {
             auto attn  = std::dynamic_pointer_cast<Attention>(blocks["attn"]);
             auto mlp   = std::dynamic_pointer_cast<MLP>(blocks["mlp"]);
             auto adaln = std::dynamic_pointer_cast<AdaLayerNormModulation>(blocks["adaln_proj"]);
-            auto mods  = adaln->forward(ctx, t_emb);
+            auto mods  = direct_schedule_modulation(ctx, schedule_indices);
+            if (mods == nullptr) {
+                mods = adaln->forward(ctx, t_emb);
+            }
 
             auto h = modulate_segments(ctx->ggml_ctx,
                                        norm1->forward(ctx, x),
@@ -482,31 +574,81 @@ namespace MiniMaxH3 {
 
     struct FinalLayer : public GGMLBlock {
         Config config;
+        std::string prefix;
 
         explicit FinalLayer(const Config& config)
             : config(config) {
             int64_t video_dim    = config.video_latent_channels * config.patch_t * config.patch_h * config.patch_w;
             blocks["norm"]       = std::make_shared<RMSNorm>(config.hidden_size, config.final_norm_eps);
-            blocks["adaln_proj"] = std::make_shared<AdaLayerNormModulation>(config.time_embed_dim,
-                                                                            config.hidden_size,
-                                                                            2,
-                                                                            1,
-                                                                            !config.uses_adaln_curves(),
-                                                                            config.uses_adaln_curves());
+            if (!config.uses_direct_adaln_schedule()) {
+                blocks["adaln_proj"] = std::make_shared<AdaLayerNormModulation>(config.time_embed_dim,
+                                                                                config.hidden_size,
+                                                                                2,
+                                                                                1,
+                                                                                !config.uses_adaln_curves(),
+                                                                                config.uses_adaln_curves());
+            }
             blocks["video_out"]  = std::make_shared<Linear>(config.hidden_size, video_dim, true, true);
             blocks["audio_out"]  = std::make_shared<Linear>(config.hidden_size, config.audio_latent_channels, true, true);
+        }
+
+        void init_params(ggml_context* ctx,
+                         const String2TensorStorage& tensors = {},
+                         const std::string prefix            = "") override {
+            this->prefix = prefix;
+            GGMLBlock::init_params(ctx, tensors, prefix);
+            if (config.uses_direct_adaln_schedule()) {
+                params["adaln_schedule.weight"] = ggml_new_tensor_2d(ctx,
+                                                                     GGML_TYPE_F32,
+                                                                     config.hidden_size * 2,
+                                                                     FASTH3_SCHEDULE_ROWS);
+            }
+        }
+
+        ggml_tensor* direct_schedule_modulation(GGMLRunnerContext* ctx,
+                                                ggml_tensor* schedule_indices) const {
+            ggml_tensor* table = nullptr;
+            if (config.uses_direct_adaln_schedule()) {
+                table = params.at("adaln_schedule.weight");
+            } else if (ctx->weight_adapter) {
+                auto empty = ggml_ext_zeros(ctx->ggml_ctx,
+                                            config.hidden_size * 2,
+                                            FASTH3_SCHEDULE_ROWS,
+                                            1,
+                                            1);
+                auto patched = ctx->weight_adapter->patch_weight(ctx->ggml_ctx,
+                                                                 ctx->backend,
+                                                                 empty,
+                                                                 prefix + "adaln_schedule.weight");
+                if (patched != empty) {
+                    table = patched;
+                }
+            }
+            if (table == nullptr) {
+                return nullptr;
+            }
+            if (schedule_indices == nullptr) {
+                throw std::runtime_error(
+                    "FastH3 direct AdaLN tables require the trained "
+                    "999/749/500/250 sigma grid");
+            }
+            return ggml_get_rows(ctx->ggml_ctx, table, schedule_indices);
         }
 
         std::pair<ggml_tensor*, ggml_tensor*> forward(GGMLRunnerContext* ctx,
                                                       ggml_tensor* x,
                                                       ggml_tensor* t_emb,
+                                                      ggml_tensor* schedule_indices,
                                                       const TokenModulationSpan& video,
                                                       const TokenModulationSpan& audio) {
             auto norm      = std::dynamic_pointer_cast<RMSNorm>(blocks["norm"]);
             auto adaln     = std::dynamic_pointer_cast<AdaLayerNormModulation>(blocks["adaln_proj"]);
             auto video_out = std::dynamic_pointer_cast<Linear>(blocks["video_out"]);
             auto audio_out = std::dynamic_pointer_cast<Linear>(blocks["audio_out"]);
-            auto mods      = adaln->forward(ctx, t_emb);
+            auto mods      = direct_schedule_modulation(ctx, schedule_indices);
+            if (mods == nullptr) {
+                mods = adaln->forward(ctx, t_emb);
+            }
             auto apply     = [&](const TokenModulationSpan& segment) {
                 auto row   = modulation_row(ctx->ggml_ctx, mods, config.hidden_size, 2, 1, segment.modulation_row);
                 auto value = norm->forward(ctx, ggml_ext_slice(ctx->ggml_ctx, x, 1, segment.start, segment.end));
@@ -522,8 +664,7 @@ namespace MiniMaxH3 {
     struct MiniMaxH3Transformer3DModel : public GGMLBlock {
         Config config;
 
-        MiniMaxH3Transformer3DModel(const Config& config,
-                                    bool stabilize_distilled_context)
+        explicit MiniMaxH3Transformer3DModel(const Config& config)
             : config(config) {
             if (fp16_mlp_enabled()) {
                 LOG_INFO("MiniMax-H3 FP16 MLP compute enabled");
@@ -531,16 +672,16 @@ namespace MiniMaxH3 {
             int64_t video_dim          = config.video_latent_channels * config.patch_t * config.patch_h * config.patch_w;
             blocks["video_patch_proj"] = std::make_shared<Linear>(video_dim, config.hidden_size, true, true);
             blocks["audio_patch_proj"] = std::make_shared<Linear>(config.audio_latent_channels, config.hidden_size, true, true);
-            // Distilled text adapters can emit O(1e4) outliers. For that path,
-            // exact rescaling keeps Q8_1 block sums in FP16 range during the
+            // H3 text encoders can emit large context outliers. Exact
+            // rescaling keeps Q8_1 block sums in FP16 range during the
             // quantized matmul, then restores the scale before adding bias.
             blocks["condition_proj"] = std::make_shared<Linear>(config.text_dim,
                                                                 config.hidden_size,
                                                                 true,
                                                                 false,
-                                                                stabilize_distilled_context,
-                                                                stabilize_distilled_context ? 1.f / 128.f : 1.f);
-            if (!config.uses_adaln_curves()) {
+                                                                true,
+                                                                1.f / 128.f);
+            if (config.uses_time_embedder()) {
                 blocks["time_embedder"] = std::make_shared<TimeEmbedder>(config.timestep_input_dim,
                                                                          config.time_embed_hidden_size,
                                                                          config.time_embed_dim);
@@ -586,8 +727,11 @@ namespace MiniMaxH3 {
                                     ggml_tensor* curve_indices,
                                     ggml_tensor* curve_upper_indices,
                                     ggml_tensor* curve_fractions) {
-            if (!config.uses_adaln_curves()) {
+            if (config.uses_time_embedder()) {
                 return std::dynamic_pointer_cast<TimeEmbedder>(blocks["time_embedder"])->forward(ctx, timestep_features);
+            }
+            if (config.uses_direct_adaln_schedule()) {
+                return nullptr;
             }
             auto lower = ggml_get_rows(ctx->ggml_ctx, params["adaln_t_table"], curve_indices);
             auto upper = ggml_get_rows(ctx->ggml_ctx, params["adaln_t_table"], curve_upper_indices);
@@ -636,6 +780,7 @@ namespace MiniMaxH3 {
                                                       ggml_tensor* curve_indices,
                                                       ggml_tensor* curve_upper_indices,
                                                       ggml_tensor* curve_fractions,
+                                                      ggml_tensor* schedule_indices,
                                                       const std::vector<TokenModulationSpan>& segments,
                                                       const std::vector<SequenceSegment>& sequence_segments,
                                                       const TokenModulationSpan& video_segment,
@@ -734,14 +879,19 @@ namespace MiniMaxH3 {
             auto pe    = build_rope(ctx, position_ids);
             for (int64_t i = 0; i < config.num_layers; ++i) {
                 auto block = std::dynamic_pointer_cast<TransformerBlock>(blocks["blocks." + std::to_string(i)]);
-                h          = block->forward(ctx, h, t_emb, segments, pe);
+                h          = block->forward(ctx, h, t_emb, schedule_indices, segments, pe);
                 sd::ggml_graph_cut::mark_graph_cut(h,
                                                    "minimax_h3.blocks." + std::to_string(i),
                                                    "hidden_states");
             }
 
             auto final_layer = std::dynamic_pointer_cast<FinalLayer>(blocks["final_layer"]);
-            auto output      = final_layer->forward(ctx, h, t_emb, video_segment, audio_segment);
+            auto output      = final_layer->forward(ctx,
+                                                    h,
+                                                    t_emb,
+                                                    schedule_indices,
+                                                    video_segment,
+                                                    audio_segment);
             auto video_out   = DiT::unpatchify_3d(ctx->ggml_ctx,
                                                   output.first,
                                                   video->ne[2] / config.patch_t,
@@ -799,6 +949,54 @@ namespace MiniMaxH3 {
         return static_cast<int>(values->size() - 1);
     }
 
+    static std::vector<int32_t> fasth3_schedule_indices(const std::vector<float>& timesteps,
+                                                        bool log_failure = true) {
+        // FastH3 Preview v1 checkpoint metadata records the unshifted training
+        // indices 999, 749, 500, and 250. These are their distinct video-shift
+        // 12 and audio-shift 3 model timesteps, sorted like the offline table.
+        constexpr float tolerance = 2e-5f;
+        std::vector<int32_t> result;
+        result.reserve(timesteps.size());
+        for (float timestep : timesteps) {
+            float best_error = std::numeric_limits<float>::max();
+            int32_t best      = -1;
+            for (int32_t index = 0; index < FASTH3_SCHEDULE_ROWS; ++index) {
+                float error = std::abs(timestep - FASTH3_TRAINED_TIMESTEPS[static_cast<size_t>(index)]);
+                if (error < best_error) {
+                    best_error = error;
+                    best       = index;
+                }
+            }
+            if (best_error > tolerance) {
+                if (log_failure) {
+                    LOG_ERROR("FastH3 schedule does not contain model timestep %.9f "
+                              "(nearest row %d is %.9f, error %.9g)",
+                              timestep,
+                              best,
+                              FASTH3_TRAINED_TIMESTEPS[static_cast<size_t>(best)],
+                              best_error);
+                }
+                return {};
+            }
+            result.push_back(best);
+        }
+        return result;
+    }
+
+    static std::vector<float> fasth3_video_sigmas() {
+        // The four student forwards use the source checkpoint's exact
+        // unshifted training indices 999, 749, 500, and 250. Store their
+        // video-shift-12 sigmas directly so the generic four-step scheduler
+        // cannot round them to 1000, 750, 500, and 250 instead.
+        return {
+            1.f - FASTH3_TRAINED_TIMESTEPS[0],
+            1.f - FASTH3_TRAINED_TIMESTEPS[2],
+            1.f - FASTH3_TRAINED_TIMESTEPS[3],
+            1.f - FASTH3_TRAINED_TIMESTEPS[5],
+            0.f,
+        };
+    }
+
     static PackedSequenceLayout build_layout(int64_t text_len,
                                              int64_t latent_t,
                                              int64_t latent_h,
@@ -830,10 +1028,14 @@ namespace MiniMaxH3 {
 
         int video_time_row           = find_or_add_timestep(&layout.timesteps, video_t);
         int audio_time_row           = find_or_add_timestep(&layout.timesteps, audio_timestep);
-        int condition_time_row       = find_or_add_timestep(&layout.timesteps,
+        int condition_time_row = condition_videos.empty()
+                                     ? -1
+                                     : find_or_add_timestep(&layout.timesteps,
                                                             std::max(video_t, VISUAL_COND_TIMESTEP));
-        int audio_condition_time_row = find_or_add_timestep(&layout.timesteps,
-                                                            std::max(audio_timestep, 1.f));
+        int audio_condition_time_row = condition_audios.empty()
+                                           ? -1
+                                           : find_or_add_timestep(&layout.timesteps,
+                                                                  std::max(audio_timestep, 1.f));
 
         int64_t run_start = 0;
         int current_tag   = text_tags.empty() ? 1 : text_tags[0];
@@ -1041,6 +1243,7 @@ namespace MiniMaxH3 {
         sd::Tensor<int32_t> curve_index_input_cache;
         sd::Tensor<int32_t> curve_upper_index_input_cache;
         sd::Tensor<float> curve_fraction_input_cache;
+        sd::Tensor<int32_t> fasth3_schedule_index_input_cache;
         std::vector<std::unique_ptr<RefinedContextCacheEntry>> refined_context_cache;
 
         MiniMaxH3Runner(ggml_backend_t backend,
@@ -1049,13 +1252,16 @@ namespace MiniMaxH3 {
                         std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
             : DiffusionModelRunner(backend, prefix, weight_manager),
               config(Config::detect_from_weights(tensors, prefix)),
-              model(config,
-                    tensors.find("text_encoders.llm_adapter.net.0.weight") != tensors.end()) {
+              model(config) {
             model.init(params_ctx, tensors, prefix);
         }
 
         std::string get_desc() override {
             return "minimax_h3";
+        }
+
+        bool uses_direct_adaln_schedule() const {
+            return config.uses_direct_adaln_schedule();
         }
 
         void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors,
@@ -1258,6 +1464,7 @@ namespace MiniMaxH3 {
             ggml_tensor* curve_indices       = nullptr;
             ggml_tensor* curve_upper_indices = nullptr;
             ggml_tensor* curve_fractions     = nullptr;
+            ggml_tensor* schedule_indices    = nullptr;
             if (config.uses_adaln_curves()) {
                 std::vector<int32_t> indices(layout.timesteps.size());
                 std::vector<int32_t> upper_indices(layout.timesteps.size());
@@ -1293,6 +1500,18 @@ namespace MiniMaxH3 {
                 timestep_features = make_input(timestep_feature_input_cache);
             }
 
+            if (config.uses_direct_adaln_schedule() || weight_adapter != nullptr) {
+                auto schedule_index_values = fasth3_schedule_indices(
+                    layout.timesteps,
+                    config.uses_direct_adaln_schedule());
+                if (!schedule_index_values.empty()) {
+                    fasth3_schedule_index_input_cache = sd::Tensor<int32_t>(
+                        {static_cast<int64_t>(schedule_index_values.size())},
+                        schedule_index_values);
+                    schedule_indices = make_input(fasth3_schedule_index_input_cache);
+                }
+            }
+
             auto runner_ctx = get_context();
             auto output     = model.forward(&runner_ctx,
                                             video,
@@ -1305,6 +1524,7 @@ namespace MiniMaxH3 {
                                             curve_indices,
                                             curve_upper_indices,
                                             curve_fractions,
+                                            schedule_indices,
                                             layout.segments,
                                             layout.sequence_segments,
                                             layout.video_segment,
@@ -1358,12 +1578,18 @@ namespace MiniMaxH3 {
                                    extra->video_sigma_shift,
                                    extra->audio_sigma_shift);
             };
-            return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph,
-                                                                              n_threads,
-                                                                              false,
-                                                                              false,
-                                                                              false),
-                                                   params.x->dim());
+            try {
+                return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph,
+                                                                                  n_threads,
+                                                                                  false,
+                                                                                  false,
+                                                                                  false),
+                                                       params.x->dim());
+            } catch (const std::exception& error) {
+                LOG_ERROR("MiniMax-H3 graph construction failed: %s", error.what());
+                runner_done();
+                return {};
+            }
         }
 
     protected:

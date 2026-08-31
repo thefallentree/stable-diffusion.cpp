@@ -1039,6 +1039,37 @@ public:
                                    ggml_tensor* b,
                                    const std::string& prefix,
                                    WeightAdapter::ForwardParams forward_params) override {
+        // Merging a full-rank delta into a quantized weight first requires
+        // dequantizing the entire base tensor.  Besides being wasteful at
+        // runtime, reshaped K-quant tensors do not have a CUDA non-contiguous
+        // conversion kernel.  Keep the quantized base matmul intact and add
+        // both full-rank and low-rank adapter outputs instead:
+        //
+        //     x (Wq + delta) == x Wq + x delta
+        //
+        // This is also the path already used by tensorwise-int8 linears.
+        const bool quantized_linear =
+            forward_params.op_type == ForwardParams::op_type_t::OP_LINEAR &&
+            w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_F16;
+        if (quantized_linear) {
+            if (b) {
+                b = patch_weight(ctx, backend, b, prefix + "bias", false);
+            }
+            auto out = ggml_ext_linear(ctx,
+                                       x,
+                                       w,
+                                       b,
+                                       forward_params.linear.force_prec_f32,
+                                       forward_params.linear.scale);
+            return add_lora_to_output(ctx,
+                                      backend,
+                                      x,
+                                      w,
+                                      out,
+                                      prefix,
+                                      forward_params);
+        }
+
         w = patch_weight(ctx, backend, w, prefix + "weight", false);
         if (b) {
             b = patch_weight(ctx, backend, b, prefix + "bias", false);

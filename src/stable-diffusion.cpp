@@ -3213,7 +3213,13 @@ public:
     void set_flow_shift(float flow_shift = INFINITY) {
         auto flow_denoiser = std::dynamic_pointer_cast<DiscreteFlowDenoiser>(denoiser);
         if (flow_denoiser) {
-            if (flow_shift == INFINITY) {
+            const bool default_requested = std::isinf(flow_shift) && flow_shift > 0.f;
+            if (!std::isfinite(flow_shift) || flow_shift <= 0.f) {
+                if (!default_requested) {
+                    LOG_WARN("invalid flow shift %.9g; using model default %.9g",
+                             flow_shift,
+                             default_flow_shift);
+                }
                 flow_shift = default_flow_shift;
             }
             flow_denoiser->set_shift(flow_shift);
@@ -4467,11 +4473,19 @@ struct SamplePlan {
             } else if (sd_version_is_minimax_h3(sd_ctx->sd->version) && request->frames > 0) {
                 sample_seq_len *= sd_ctx->sd->video_frames_to_latent_frames(request->frames);
             }
-            sigmas = sd_ctx->sd->denoiser->get_sigmas(total_steps,
-                                                      sample_seq_len,
-                                                      scheduler,
-                                                      sd_ctx->sd->version,
-                                                      sample_params->extra_sample_args);
+            auto h3_runner = std::dynamic_pointer_cast<MiniMaxH3::MiniMaxH3Runner>(
+                sd_ctx->sd->diffusion_model);
+            if (h3_runner != nullptr && h3_runner->uses_direct_adaln_schedule() &&
+                total_steps == 4 && std::abs(sd_ctx->sd->active_flow_shift - 12.f) < 1e-5f) {
+                sigmas = MiniMaxH3::fasth3_video_sigmas();
+                LOG_INFO("using exact FastH3 999/749/500/250 sigma schedule");
+            } else {
+                sigmas = sd_ctx->sd->denoiser->get_sigmas(total_steps,
+                                                          sample_seq_len,
+                                                          scheduler,
+                                                          sd_ctx->sd->version,
+                                                          sample_params->extra_sample_args);
+            }
         }
 
         eta = resolve_eta(sd_ctx, eta, sample_method);
