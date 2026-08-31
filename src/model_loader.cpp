@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <mutex>
 #include <regex>
 #include <set>
@@ -252,7 +253,9 @@ bool ModelLoader::init_from_gguf_file(const std::string& file_path, const std::s
 
 /*================================================= SafeTensorsModelLoader ==================================================*/
 
-bool ModelLoader::init_from_safetensors_file(const std::string& file_path, const std::string& prefix) {
+bool ModelLoader::init_from_safetensors_file(const std::string& file_path,
+                                             const std::string& prefix,
+                                             const std::set<std::string>* indexed_tensor_names) {
     LOG_DEBUG("init from '%s', prefix = '%s'", file_path.c_str(), prefix.c_str());
 
     std::vector<TensorStorage> tensor_storages;
@@ -264,7 +267,14 @@ bool ModelLoader::init_from_safetensors_file(const std::string& file_path, const
 
     size_t file_index = add_file_path(file_path);
 
+    std::set<std::string> found_indexed_names;
     for (auto& tensor_storage : tensor_storages) {
+        if (indexed_tensor_names != nullptr) {
+            if (indexed_tensor_names->find(tensor_storage.name) == indexed_tensor_names->end()) {
+                continue;
+            }
+            found_indexed_names.insert(tensor_storage.name);
+        }
         if (is_unused_tensor(tensor_storage.name)) {
             continue;
         }
@@ -279,21 +289,41 @@ bool ModelLoader::init_from_safetensors_file(const std::string& file_path, const
         // LOG_DEBUG("%s", tensor_storage.to_string().c_str());
     }
 
+    if (indexed_tensor_names != nullptr && found_indexed_names != *indexed_tensor_names) {
+        std::vector<std::string> missing;
+        std::set_difference(indexed_tensor_names->begin(),
+                            indexed_tensor_names->end(),
+                            found_indexed_names.begin(),
+                            found_indexed_names.end(),
+                            std::back_inserter(missing));
+        LOG_ERROR("safetensors shard '%s' is missing %zu tensor(s) declared by its index%s%s",
+                  file_path.c_str(),
+                  missing.size(),
+                  missing.empty() ? "" : ": ",
+                  missing.empty() ? "" : missing.front().c_str());
+        return false;
+    }
+
     return true;
 }
 
 bool ModelLoader::init_from_safetensors_index_file(const std::string& file_path, const std::string& prefix) {
     LOG_DEBUG("init from safetensors index '%s', prefix = '%s'", file_path.c_str(), prefix.c_str());
 
-    std::vector<std::string> shard_paths;
+    std::map<std::string, std::string> tensor_shard_paths;
     std::string error;
-    if (!read_safetensors_index_file(file_path, shard_paths, &error)) {
+    if (!read_safetensors_index_file(file_path, tensor_shard_paths, &error)) {
         LOG_ERROR("%s", error.c_str());
         return false;
     }
 
-    for (const std::string& shard_path : shard_paths) {
-        if (!init_from_file(shard_path, prefix)) {
+    std::map<std::string, std::set<std::string>> shard_tensor_names;
+    for (const auto& [tensor_name, shard_path] : tensor_shard_paths) {
+        shard_tensor_names[shard_path].insert(tensor_name);
+    }
+
+    for (const auto& [shard_path, tensor_names] : shard_tensor_names) {
+        if (!init_from_safetensors_file(shard_path, prefix, &tensor_names)) {
             return false;
         }
     }
@@ -477,8 +507,13 @@ SDVersion ModelLoader::get_sd_version() {
         if (tensor_storage.name.find("model.diffusion_model.adaln_single.emb.timestep_embedder.linear_1.bias") != std::string::npos) {
             return VERSION_LTXAV;
         }
-        if (tensor_storage.name.find("model.diffusion_model.video_patch_proj.weight") != std::string::npos &&
-            tensor_storage_map.find("model.diffusion_model.audio_patch_proj.weight") != tensor_storage_map.end()) {
+        const bool has_minimax_h3_native_inputs =
+            tensor_storage.name.find("model.diffusion_model.video_patch_proj.weight") != std::string::npos &&
+            tensor_storage_map.find("model.diffusion_model.audio_patch_proj.weight") != tensor_storage_map.end();
+        const bool has_minimax_h3_diffusers_inputs =
+            tensor_storage.name.find("model.diffusion_model.proj_in.weight") != std::string::npos &&
+            tensor_storage_map.find("model.diffusion_model.audio_proj_in.weight") != tensor_storage_map.end();
+        if (has_minimax_h3_native_inputs || has_minimax_h3_diffusers_inputs) {
             return VERSION_MINIMAX_H3;
         }
         if (tensor_storage.name.find("model.diffusion_model.blocks.0.cross_attn.norm_k.weight") != std::string::npos) {
@@ -1440,7 +1475,9 @@ bool ModelLoader::load_tensors(std::map<std::string, ggml_tensor*>& tensors,
     return true;
 }
 
-bool ModelLoader::tensor_should_be_converted(const TensorStorage& tensor_storage, ggml_type type) {
+bool ModelLoader::tensor_should_be_converted(const TensorStorage& tensor_storage,
+                                             ggml_type type,
+                                             bool explicit_override) {
     const std::string& name = tensor_storage.name;
     if (tensor_storage.is_int8_tensorwise) {
         return false;
@@ -1448,6 +1485,12 @@ bool ModelLoader::tensor_should_be_converted(const TensorStorage& tensor_storage
     if (type != GGML_TYPE_COUNT) {
         if (ggml_is_quantized(type) && tensor_storage.ne[0] % ggml_blck_size(type) != 0) {
             // Pass, do not convert
+        } else if (explicit_override) {
+            // An explicit tensor-type rule is an operator request, not the
+            // default quantization policy. In particular, callers need to be
+            // able to upcast sensitive norms/biases and convert BF16 boundary
+            // projections to native FP16 on pre-Ampere CUDA devices.
+            return true;
         } else if (ends_with(name, ".bias")) {
             // Pass, do not convert
         } else if (ends_with(name, ".scale")) {

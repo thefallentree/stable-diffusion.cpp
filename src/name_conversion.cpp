@@ -827,6 +827,44 @@ std::string convert_diffusers_dit_to_original_krea2(std::string name) {
     return name;
 }
 
+std::string convert_diffusers_dit_to_original_minimax_h3(std::string name) {
+    // Diffusers uses separate Q/K/V projections while the native H3 layout
+    // stores one fused QKV tensor.  The numbered suffixes are consumed by the
+    // LoRA loader, which concatenates the three adapter outputs in order.
+    static const std::vector<std::pair<std::string, std::string>> prefix_map = {
+        {"transformer_blocks.", "blocks."},
+        {"token_refiner.refiner_blocks.", "token_refiner.blocks."},
+        {"token_refiner.final_norm.", "token_refiner.final_norm."},
+        {"time_embedder.linear_1.", "time_embedder.proj_in."},
+        {"time_embedder.linear_2.", "time_embedder.proj_out."},
+        {"norm_out.adaln_schedule.", "final_layer.adaln_schedule."},
+        {"norm_out.linear.", "final_layer.adaln_proj.linear."},
+        {"norm_out.norm.", "final_layer.norm."},
+        {"audio_proj_in.", "audio_patch_proj."},
+        {"audio_proj_out.", "final_layer.audio_out."},
+        {"context_embedder.", "condition_proj."},
+        {"proj_in.", "video_patch_proj."},
+        {"proj_out.", "final_layer.video_out."},
+    };
+    static const std::vector<std::pair<std::string, std::string>> name_map = {
+        {".attn.to_q.weight", ".attn.qkv_proj.weight"},
+        {".attn.to_q.bias", ".attn.qkv_proj.bias"},
+        {".attn.to_k.weight", ".attn.qkv_proj.weight.1"},
+        {".attn.to_k.bias", ".attn.qkv_proj.bias.1"},
+        {".attn.to_v.weight", ".attn.qkv_proj.weight.2"},
+        {".attn.to_v.bias", ".attn.qkv_proj.bias.2"},
+        {".attn.to_out.0.", ".attn.out_proj."},
+        {".attn.norm_q.", ".attn.q_norm."},
+        {".attn.norm_k.", ".attn.k_norm."},
+        {".ff.net.0.proj.", ".mlp.fc1."},
+        {".ff.net.2.", ".mlp.fc2."},
+    };
+
+    replace_with_prefix_map(name, prefix_map);
+    replace_with_name_map(name, name_map);
+    return name;
+}
+
 // Convert a diffusers-format ControlNet tensor name to the original (LDM/lllyasviel) layout
 // declared by ControlNetBlock. Reuses the UNet down/mid conversion for the shared encoder
 // (down_blocks, mid_block, time_embedding, add_embedding, conv_in) and adds the ControlNet-only
@@ -900,6 +938,8 @@ std::string convert_diffusion_model_name(std::string name, std::string prefix, S
         name = convert_other_dit_to_original_anima(name);
     } else if (sd_version_is_krea2(version)) {
         name = convert_diffusers_dit_to_original_krea2(name);
+    } else if (sd_version_is_minimax_h3(version)) {
+        name = convert_diffusers_dit_to_original_minimax_h3(name);
     }
     return name;
 }
@@ -1441,6 +1481,24 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
             "transformer_blocks",
             "single_transformer_blocks",
         };
+        if (sd_version_is_minimax_h3(version)) {
+            // FastH3 and Diffusers H3 adapters store the transformer roots
+            // without a model prefix.  Mark every H3 root as a diffusion-model
+            // tensor before module filtering and name conversion run.
+            const std::vector<std::string> minimax_h3_prefixes = {
+                "audio_proj_in.",
+                "audio_proj_out.",
+                "context_embedder.",
+                "norm_out.",
+                "proj_in.",
+                "proj_out.",
+                "time_embedder.",
+                "token_refiner.",
+            };
+            dit_prefix_vec.insert(dit_prefix_vec.end(),
+                                  minimax_h3_prefixes.begin(),
+                                  minimax_h3_prefixes.end());
+        }
         for (const auto& prefix : dit_prefix_vec) {
             if (starts_with(name, prefix)) {
                 name = "transformer." + name;

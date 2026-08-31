@@ -43,7 +43,9 @@ protected:
     void add_tensor_storage(const TensorStorage& tensor_storage);
 
     bool init_from_gguf_file(const std::string& file_path, const std::string& prefix = "");
-    bool init_from_safetensors_file(const std::string& file_path, const std::string& prefix = "");
+    bool init_from_safetensors_file(const std::string& file_path,
+                                    const std::string& prefix = "",
+                                    const std::set<std::string>* indexed_tensor_names = nullptr);
     bool init_from_safetensors_index_file(const std::string& file_path, const std::string& prefix = "");
     bool init_from_torch_zip_file(const std::string& file_path, const std::string& prefix = "");
     bool init_from_torch_legacy_file(const std::string& file_path, const std::string& prefix = "");
@@ -92,7 +94,9 @@ public:
         return names;
     }
 
-    bool tensor_should_be_converted(const TensorStorage& tensor_storage, ggml_type type);
+    bool tensor_should_be_converted(const TensorStorage& tensor_storage,
+                                    ggml_type type,
+                                    bool explicit_override = false);
     int64_t get_params_mem_size(ggml_backend_t backend, ggml_type type = GGML_TYPE_COUNT);
     ~ModelLoader() = default;
 };

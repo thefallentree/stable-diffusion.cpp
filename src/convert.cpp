@@ -36,16 +36,20 @@ static ggml_type get_export_tensor_type(ModelLoader& model_loader,
     const std::string& name = tensor_storage.name;
     ggml_type tensor_type   = tensor_storage.type;
     ggml_type dst_type      = type;
+    bool explicit_override  = false;
 
     for (const auto& tensor_type_rule : tensor_type_rules) {
         std::regex pattern(tensor_type_rule.first);
         if (std::regex_search(name, pattern)) {
             dst_type = tensor_type_rule.second;
+            explicit_override = true;
             break;
         }
     }
 
-    if (model_loader.tensor_should_be_converted(tensor_storage, dst_type)) {
+    if (model_loader.tensor_should_be_converted(tensor_storage,
+                                                dst_type,
+                                                explicit_override)) {
         tensor_type = dst_type;
     }
 

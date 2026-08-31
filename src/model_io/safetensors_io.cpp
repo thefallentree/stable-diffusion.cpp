@@ -8,7 +8,6 @@
 #include <ostream>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "binary_io.h"
@@ -357,9 +356,9 @@ bool read_safetensors_file(const std::string& file_path,
 }
 
 bool read_safetensors_index_file(const std::string& file_path,
-                                 std::vector<std::string>& shard_paths,
+                                 std::map<std::string, std::string>& tensor_shard_paths,
                                  std::string* error) {
-    shard_paths.clear();
+    tensor_shard_paths.clear();
 
     std::ifstream file(file_path);
     if (!file.is_open()) {
@@ -380,21 +379,17 @@ bool read_safetensors_index_file(const std::string& file_path,
         return false;
     }
 
-    std::unordered_set<std::string> seen_shard_paths;
     for (const auto& item : index["weight_map"].items()) {
         if (!item.value().is_string()) {
             set_error(error, "invalid shard path for tensor '" + item.key() + "'");
             return false;
         }
 
-        std::string shard_path = resolve_index_shard_path(file_path,
-                                                          item.value().get<std::string>());
-        if (seen_shard_paths.insert(shard_path).second) {
-            shard_paths.push_back(std::move(shard_path));
-        }
+        tensor_shard_paths[item.key()] = resolve_index_shard_path(
+            file_path, item.value().get<std::string>());
     }
 
-    if (shard_paths.empty()) {
+    if (tensor_shard_paths.empty()) {
         set_error(error, "safetensors index has no tensors: '" + file_path + "'");
         return false;
     }
