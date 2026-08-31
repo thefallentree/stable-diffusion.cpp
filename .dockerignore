@@ -3,5 +3,6 @@ docs/
 test/
 
 .cache/
+**/node_modules/
 *.swp
 models/
