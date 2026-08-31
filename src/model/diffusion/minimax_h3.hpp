@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <memory>
 #include <set>
 #include <string>
@@ -19,6 +20,14 @@ namespace MiniMaxH3 {
     constexpr int H3_GRAPH_SIZE          = 131072;
     constexpr float FRAME_RESCALE        = 5.f / 3.f;
     constexpr float VISUAL_COND_TIMESTEP = 0.999f;
+
+    static bool fp16_mlp_enabled() {
+        static const bool enabled = []() {
+            const char* value = std::getenv("SD_MINIMAX_H3_MLP_FP16");
+            return value != nullptr && std::string(value) == "1";
+        }();
+        return enabled;
+    }
 
     struct Config {
         int64_t hidden_size              = 5376;
@@ -140,8 +149,9 @@ namespace MiniMaxH3 {
     struct MLP : public UnaryBlock {
         MLP(int64_t hidden_size,
             int64_t ffn_hidden_size) {
-            blocks["fc1"] = std::make_shared<Linear>(hidden_size, ffn_hidden_size * 2, false, false, true, 1.f / 128.f);
-            blocks["fc2"] = std::make_shared<Linear>(ffn_hidden_size, hidden_size, false, false, true, 1.f / 128.f);
+            const bool force_prec_f32 = !fp16_mlp_enabled();
+            blocks["fc1"] = std::make_shared<Linear>(hidden_size, ffn_hidden_size * 2, false, false, force_prec_f32, 1.f / 128.f);
+            blocks["fc2"] = std::make_shared<Linear>(ffn_hidden_size, hidden_size, false, false, force_prec_f32, 1.f / 128.f);
         }
 
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
@@ -504,6 +514,9 @@ namespace MiniMaxH3 {
         MiniMaxH3Transformer3DModel(const Config& config,
                                     bool stabilize_distilled_context)
             : config(config) {
+            if (fp16_mlp_enabled()) {
+                LOG_INFO("MiniMax-H3 FP16 MLP compute enabled");
+            }
             int64_t video_dim          = config.video_latent_channels * config.patch_t * config.patch_h * config.patch_w;
             blocks["video_patch_proj"] = std::make_shared<Linear>(video_dim, config.hidden_size, true, true);
             blocks["audio_patch_proj"] = std::make_shared<Linear>(config.audio_latent_channels, config.hidden_size, true, true);
