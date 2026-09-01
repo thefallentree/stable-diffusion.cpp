@@ -96,23 +96,30 @@ sd-cli -m model.safetensors -p "a cat" --backend "diffusion=cuda0&cuda1" --split
 sd-cli -m model.safetensors -p "a cat" --backend "diffusion=cuda0&cuda1,te=cuda0&cuda1" --split-mode diffusion=row,te=layer
 ```
 
-In row mode the module keeps executing on its main (first listed) device, but
-its transformer-block matmul weights are allocated in the backend's row-split
-buffer type, which slices each weight's rows across the listed devices in
-proportion to free memory and runs those matmuls on all devices in parallel.
-Compared to a layer split this uses all GPUs within every layer (instead of
-sequentially device by device) at the cost of a cross-device reduction per
-matmul - usually the faster option when the devices have fast interconnect.
+In row mode the listed accelerator devices are wrapped in a tensor-parallel
+meta backend. Model-specific split layouts distribute supported
+transformer-block matmul weights across every device, execute those matmuls in
+parallel, and combine their partial results. Unsupported weights and model
+layouts are mirrored so that row mode remains correct while support is added
+incrementally.
 
-Row split requires backend support for split buffers and is currently
-available on CUDA only; on other backends (or when the listed devices belong
-to different backend registries) the module falls back to a layer split.
-Embeddings, normalization weights, biases and other non-block tensors stay in
-regular buffers on the main device.
+MiniMax H3 diffusion and token-refiner blocks currently have an explicit
+layout. Their fused QKV and SwiGLU input projections are column-parallel, with
+each fused segment divided independently so a device receives complete local
+heads/channels. Attention output and SwiGLU output projections are
+row-parallel. Splits preserve both 128-element kernel alignment and the
+weight's quantization-block alignment. Other H3 tensors are mirrored.
 
-Direct ("immediately") LoRA application cannot patch row-split tensors; with
+Compared with a layer split, a supported row layout uses all devices within
+each layer instead of running complete layers sequentially on different
+devices. This adds communication to each sharded projection, so it is most
+useful when the projections are large enough and the devices have a fast
+interconnect. Row mode requires two or more non-CPU backend devices; a
+single-device assignment uses the regular backend unchanged.
+
+Direct ("immediately") LoRA application cannot patch sharded tensors; with
 `--split-mode row` the automatic LoRA mode selects runtime application, and an
-explicit `--lora-apply-mode immediately` skips the split tensors with a
+explicit `--lora-apply-mode immediately` skips the sharded tensors with a
 warning.
 
 ## Automatic placement (`--auto-fit`)

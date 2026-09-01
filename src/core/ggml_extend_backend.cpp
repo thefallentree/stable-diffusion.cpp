@@ -1,9 +1,11 @@
 #include "core/ggml_extend_backend.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdlib>
 #include <mutex>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -690,11 +692,144 @@ static std::string primary_device_name(const std::string& value) {
     return names.empty() ? std::string() : names.front();
 }
 
+struct SDTensorParallelSplitContext {
+    size_t n_devices = 0;
+};
+
+static const SDTensorParallelSplitContext* tensor_parallel_split_context(size_t n_devices) {
+    static const std::array<SDTensorParallelSplitContext, GGML_BACKEND_META_MAX_DEVICES + 1> contexts = []() {
+        std::array<SDTensorParallelSplitContext, GGML_BACKEND_META_MAX_DEVICES + 1> result{};
+        for (size_t i = 0; i < result.size(); ++i) {
+            result[i].n_devices = i;
+        }
+        return result;
+    }();
+    return n_devices < contexts.size() ? &contexts[n_devices] : nullptr;
+}
+
+static ggml_backend_meta_split_state mirrored_split_state() {
+    ggml_backend_meta_split_state state{};
+    state.axis       = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+    state.nr[0]      = 1;
+    state.n_segments = 1;
+    return state;
+}
+
+static bool string_ends_with(const std::string& value, const char* suffix) {
+    const size_t suffix_size = std::strlen(suffix);
+    return value.size() >= suffix_size &&
+           value.compare(value.size() - suffix_size, suffix_size, suffix) == 0;
+}
+
+static bool has_indexed_block_marker(const std::string& name, const char* marker) {
+    size_t pos = name.find(marker);
+    if (pos != std::string::npos) {
+        pos += std::strlen(marker);
+        const size_t block_begin = pos;
+        while (pos < name.size() && std::isdigit(static_cast<unsigned char>(name[pos]))) {
+            ++pos;
+        }
+        return pos > block_begin && pos < name.size() && name[pos] == '.';
+    }
+    return false;
+}
+
+static bool is_minimax_h3_parallel_block_tensor(const std::string& name) {
+    return has_indexed_block_marker(name, ".diffusion_model.blocks.") ||
+           has_indexed_block_marker(name, ".diffusion_model.token_refiner.blocks.");
+}
+
+static ggml_backend_meta_split_state split_tensor_axis(const ggml_tensor* tensor,
+                                                       size_t n_devices,
+                                                       ggml_backend_meta_split_axis axis,
+                                                       int64_t segment_size,
+                                                       uint32_t repeats,
+                                                       int64_t granularity) {
+    ggml_backend_meta_split_state state{};
+    state.axis       = axis;
+    state.nr[0]      = repeats;
+    state.n_segments = 1;
+
+    const int split_axis = static_cast<int>(axis);
+    if (tensor == nullptr || n_devices == 0 || split_axis < 0 || split_axis >= GGML_MAX_DIMS ||
+        segment_size <= 0 || repeats == 0 ||
+        segment_size * static_cast<int64_t>(repeats) != tensor->ne[split_axis]) {
+        return mirrored_split_state();
+    }
+
+    granularity = std::max<int64_t>(1, granularity);
+    int64_t low = 0;
+    for (size_t device = 0; device + 1 < n_devices; ++device) {
+        int64_t high = segment_size * static_cast<int64_t>(device + 1) /
+                       static_cast<int64_t>(n_devices);
+        high -= high % granularity;
+        state.ne[device] = high - low;
+        low = high;
+    }
+    state.ne[n_devices - 1] = segment_size - low;
+    return state;
+}
+
+// H3's transformer and token-refiner blocks use fused QKV and fused value/gate projections.
+// Split every repeated segment independently so each device receives complete
+// local attention heads and matching SwiGLU value/gate channels. Non-H3 and
+// non-block tensors remain mirrored; this keeps row mode correct for models
+// that do not yet provide an explicit tensor-parallel layout.
+static ggml_backend_meta_split_state sd_tensor_parallel_get_split_state(const ggml_tensor* tensor,
+                                                                        void* userdata) {
+    const auto* context = static_cast<const SDTensorParallelSplitContext*>(userdata);
+    if (tensor == nullptr || context == nullptr || context->n_devices < 2 ||
+        context->n_devices > GGML_BACKEND_META_MAX_DEVICES) {
+        return mirrored_split_state();
+    }
+
+    const std::string name = tensor->name;
+    if (!is_minimax_h3_parallel_block_tensor(name)) {
+        return mirrored_split_state();
+    }
+
+    if (string_ends_with(name, ".attn.qkv_proj.weight") && tensor->ne[1] % 3 == 0) {
+        return split_tensor_axis(tensor,
+                                 context->n_devices,
+                                 GGML_BACKEND_SPLIT_AXIS_1,
+                                 tensor->ne[1] / 3,
+                                 3,
+                                 128);
+    }
+    if (string_ends_with(name, ".mlp.fc1.weight") && tensor->ne[1] % 2 == 0) {
+        return split_tensor_axis(tensor,
+                                 context->n_devices,
+                                 GGML_BACKEND_SPLIT_AXIS_1,
+                                 tensor->ne[1] / 2,
+                                 2,
+                                 128);
+    }
+    if (string_ends_with(name, ".attn.out_proj.weight") ||
+        string_ends_with(name, ".mlp.fc2.weight")) {
+        const int64_t block_size = ggml_blck_size(tensor->type);
+        return split_tensor_axis(tensor,
+                                 context->n_devices,
+                                 GGML_BACKEND_SPLIT_AXIS_0,
+                                 tensor->ne[0],
+                                 1,
+                                 std::lcm<int64_t>(128, block_size));
+    }
+    return mirrored_split_state();
+}
+
 ggml_backend_t SDBackendManager::runtime_backend(SDBackendModule module) {
+    if (split_mode(module) == SDSplitMode::ROW && runtime_device_count(module) > 1) {
+        return init_tensor_parallel_backend(module);
+    }
     return init_cached_backend(primary_device_name(runtime_assignment_.get(module)));
 }
 
 std::vector<ggml_backend_t> SDBackendManager::runtime_backends(SDBackendModule module) {
+    if (split_mode(module) == SDSplitMode::ROW && runtime_device_count(module) > 1) {
+        ggml_backend_t backend = runtime_backend(module);
+        return backend == nullptr ? std::vector<ggml_backend_t>{}
+                                  : std::vector<ggml_backend_t>{backend};
+    }
     std::vector<ggml_backend_t> backends;
     for (const std::string& name : split_device_list(runtime_assignment_.get(module))) {
         ggml_backend_t backend = init_cached_backend(name);
@@ -715,6 +850,11 @@ std::vector<ggml_backend_t> SDBackendManager::runtime_backends(SDBackendModule m
         }
     }
     return backends;
+}
+
+size_t SDBackendManager::runtime_device_count(SDBackendModule module) const {
+    const std::vector<std::string> names = split_device_list(runtime_assignment_.get(module));
+    return names.empty() ? 1 : names.size();
 }
 
 ggml_backend_t SDBackendManager::params_backend(SDBackendModule module) {
@@ -941,6 +1081,81 @@ ggml_backend_t SDBackendManager::init_cached_backend(const std::string& name) {
 
     SDBackendHandle handle(backend);
     backends_.emplace(actual_key, std::move(handle));
+    return backend;
+}
+
+ggml_backend_t SDBackendManager::init_tensor_parallel_backend(SDBackendModule module) {
+    const std::vector<std::string> names = split_device_list(runtime_assignment_.get(module));
+    if (names.size() < 2 || names.size() > GGML_BACKEND_META_MAX_DEVICES) {
+        LOG_ERROR("tensor parallel %s backend needs 2-%d devices, got %zu",
+                  sd_backend_module_name(module),
+                  GGML_BACKEND_META_MAX_DEVICES,
+                  names.size());
+        return nullptr;
+    }
+
+    std::vector<ggml_backend_dev_t> devices;
+    std::vector<std::string> resolved_names;
+    devices.reserve(names.size());
+    resolved_names.reserve(names.size());
+    for (const std::string& name : names) {
+        const std::string resolved = sd_backend_resolve_name(name);
+        ggml_backend_dev_t device  = resolve_device_by_name(resolved);
+        if (device == nullptr || ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            LOG_ERROR("tensor parallel %s backend device '%s' is unavailable or not an accelerator",
+                      sd_backend_module_name(module),
+                      name.c_str());
+            return nullptr;
+        }
+        if (std::find(devices.begin(), devices.end(), device) != devices.end()) {
+            LOG_ERROR("tensor parallel %s backend repeats device '%s'",
+                      sd_backend_module_name(module),
+                      resolved.c_str());
+            return nullptr;
+        }
+        devices.push_back(device);
+        resolved_names.push_back(resolved);
+    }
+
+    std::string key = "meta:";
+    for (size_t i = 0; i < resolved_names.size(); ++i) {
+        if (i > 0) {
+            key += "&";
+        }
+        key += lower_copy(resolved_names[i]);
+    }
+    auto cached = backends_.find(key);
+    if (cached != backends_.end()) {
+        return cached->second.get();
+    }
+
+    const SDTensorParallelSplitContext* context = tensor_parallel_split_context(devices.size());
+    GGML_ASSERT(context != nullptr);
+    ggml_backend_dev_t meta_device = ggml_backend_meta_device(devices.data(),
+                                                               devices.size(),
+                                                               sd_tensor_parallel_get_split_state,
+                                                               const_cast<SDTensorParallelSplitContext*>(context));
+    if (meta_device == nullptr) {
+        LOG_ERROR("failed to create tensor parallel %s meta device", sd_backend_module_name(module));
+        return nullptr;
+    }
+    ggml_backend_t backend = ggml_backend_dev_init(meta_device, nullptr);
+    if (backend == nullptr) {
+        LOG_ERROR("failed to initialize tensor parallel %s backend", sd_backend_module_name(module));
+        return nullptr;
+    }
+
+    std::string device_list;
+    for (size_t i = 0; i < resolved_names.size(); ++i) {
+        device_list += (i == 0 ? "" : ", ") + resolved_names[i];
+    }
+    LOG_INFO("using tensor parallel %s backend across %zu devices: %s",
+             sd_backend_module_name(module),
+             devices.size(),
+             device_list.c_str());
+
+    SDBackendHandle handle(backend);
+    backends_.emplace(key, std::move(handle));
     return backend;
 }
 

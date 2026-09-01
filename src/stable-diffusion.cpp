@@ -638,7 +638,7 @@ public:
     bool row_split_active() {
         for (SDBackendModule module : {SDBackendModule::DIFFUSION, SDBackendModule::TE}) {
             if (backend_manager.split_mode(module) == SDSplitMode::ROW &&
-                backend_manager.runtime_backends(module).size() > 1) {
+                backend_manager.runtime_device_count(module) > 1) {
                 return true;
             }
         }

@@ -68,6 +68,7 @@ public:
     ggml_backend_t params_backend(SDBackendModule module);
 
     std::vector<ggml_backend_t> runtime_backends(SDBackendModule module);
+    size_t runtime_device_count(SDBackendModule module) const;
 
     SDSplitMode split_mode(SDBackendModule module) const;
     ggml_backend_buffer_type_t split_buffer_type(ggml_backend_t backend,
@@ -82,6 +83,7 @@ public:
 private:
     bool validate(std::string* error) const;
     ggml_backend_t init_cached_backend(const std::string& name);
+    ggml_backend_t init_tensor_parallel_backend(SDBackendModule module);
 };
 
 bool sd_backend_is(ggml_backend_t backend, const std::string& name);
